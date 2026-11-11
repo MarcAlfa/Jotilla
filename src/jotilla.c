@@ -809,6 +809,14 @@ static void paint_note(Note *note) {
             }
             if (note->calendar_date && text_right > text_left) {
                 RECT date_rect = {text_left, 0, text_right, bar};
+                SYSTEMTIME now;
+                unsigned today;
+                GetLocalTime(&now);
+                today = (unsigned)now.wYear * 10000u + (unsigned)now.wMonth * 100u + (unsigned)now.wDay;
+                if (!note->save_failed && note->calendar_date <= today) {
+                    BOOL light_bar = !(PALETTE_BAR_LIGHT_INK[note->palette] & (1u << note->color));
+                    SetTextColor(dc, light_bar ? RGB(185, 24, 24) : RGB(255, 130, 130));
+                }
                 if (note->date_font) SelectObject(dc, note->date_font);
                 DrawTextW(dc, date_text, -1, &date_rect,
                           DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
