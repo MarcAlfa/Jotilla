@@ -137,6 +137,7 @@ int wmain(void) {
         swprintf_s(path,1024,L"%s\\note-2026-%02d-%02d_%03d.txt",root,1+i%12,1+i%28,i);
         require(DeleteFileW(path),"remove private grid note");
     }
+    DeleteFileW(settings);
     require(RemoveDirectoryW(root),"remove private grid archive");
     printf("PASS: %d dense native grid checks, gutters, scrolling, resize, calendar, selection and monitor transitions.\n",checks);
     return 0;

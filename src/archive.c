@@ -72,9 +72,12 @@ typedef struct Archive {
     POINT note_scroll;
     BOOL calendar_view, calendar_dirty;
     BOOL rebuilding, refresh_pending, searching, tags_view, tags_dirty, tags_pending;
+    RECT normal_rect;
+    BOOL has_rect, maximized;
 } Archive;
 
 static HWND archive_window;
+static BOOL archive_topmost = TRUE;
 static void schedule_search(Archive *archive);
 static BOOL refresh_archive(Archive *archive, BOOL reload);
 static void open_archive_item(Archive *archive, int index);
@@ -86,6 +89,116 @@ static void load_preview(Archive *archive, ArchiveEntry *entry);
 
 static int entry_index(const Archive *archive, int row) {
     return archive->results ? archive->results->hits[row].index : archive->first + row;
+}
+
+typedef struct MonitorList {
+    HMONITOR handles[16];
+    MONITORINFO info[16];
+    int count;
+} MonitorList;
+
+static BOOL CALLBACK collect_monitor(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM data) {
+    MonitorList *list = (MonitorList *)data;
+    MONITORINFO info = {sizeof(info)};
+    (void)dc; (void)rect;
+    if (list->count >= 16) return FALSE;
+    if (GetMonitorInfoW(monitor, &info)) {
+        list->handles[list->count] = monitor;
+        list->info[list->count] = info;
+        ++list->count;
+    }
+    return TRUE;
+}
+
+static int monitor_number(const RECT *rect) {
+    MonitorList list = {0};
+    HMONITOR target = MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST);
+    int i;
+    EnumDisplayMonitors(NULL, NULL, collect_monitor, (LPARAM)&list);
+    for (i = 0; i < list.count; ++i) {
+        if (list.handles[i] == target) return i + 1;
+    }
+    return 1;
+}
+
+static BOOL read_browser_int(const wchar_t *settings, const wchar_t *key, int *value) {
+    wchar_t text[32], *end = NULL;
+    long parsed;
+    DWORD length = GetPrivateProfileStringW(L"app", key, L"", text, 32, settings);
+    if (!length || length >= 31) return FALSE;
+    parsed = wcstol(text, &end, 10);
+    if (!end || *end != 0 || parsed < INT_MIN || parsed > INT_MAX) return FALSE;
+    *value = (int)parsed;
+    return TRUE;
+}
+
+static void write_browser_int(const wchar_t *settings, const wchar_t *key, int value) {
+    wchar_t text[32];
+    swprintf_s(text, 32, L"%d", value);
+    WritePrivateProfileStringW(L"app", key, text, settings);
+}
+
+static void save_browser_placement(const Archive *archive) {
+    int width, height, monitor;
+    if (!archive || !archive->settings || !*archive->settings || !archive->has_rect) return;
+    width = archive->normal_rect.right - archive->normal_rect.left;
+    height = archive->normal_rect.bottom - archive->normal_rect.top;
+    if (width <= 0 || height <= 0) return;
+    monitor = monitor_number(&archive->normal_rect);
+    write_browser_int(archive->settings, L"browser_x", archive->normal_rect.left);
+    write_browser_int(archive->settings, L"browser_y", archive->normal_rect.top);
+    write_browser_int(archive->settings, L"browser_w", width);
+    write_browser_int(archive->settings, L"browser_h", height);
+    write_browser_int(archive->settings, L"browser_monitor", monitor);
+    write_browser_int(archive->settings, L"browser_maximized", archive->maximized ? 1 : 0);
+}
+
+static BOOL load_browser_placement(HWND owner, const wchar_t *settings, int dpi,
+                                   int *x, int *y, int *width, int *height, BOOL *maximized) {
+    int sx, sy, sw, sh, mon, max_flag = 0;
+    MonitorList list = {0};
+    MONITORINFO monitor = {sizeof(monitor)};
+    RECT saved, intersect;
+    HMONITOR by_rect;
+    int min_w, min_h, work_w, work_h;
+    BOOL has_mon = FALSE;
+    if (!settings || !*settings) return FALSE;
+    if (!read_browser_int(settings, L"browser_x", &sx) ||
+        !read_browser_int(settings, L"browser_y", &sy) ||
+        !read_browser_int(settings, L"browser_w", &sw) ||
+        !read_browser_int(settings, L"browser_h", &sh) ||
+        sw <= 0 || sh <= 0)
+        return FALSE;
+    if (!read_browser_int(settings, L"browser_monitor", &mon)) mon = 0;
+    read_browser_int(settings, L"browser_maximized", &max_flag);
+    EnumDisplayMonitors(NULL, NULL, collect_monitor, (LPARAM)&list);
+    SetRect(&saved, sx, sy, sx + sw, sy + sh);
+    by_rect = MonitorFromRect(&saved, MONITOR_DEFAULTTONULL);
+    if (mon >= 1 && mon <= list.count) {
+        monitor = list.info[mon - 1];
+        has_mon = TRUE;
+    } else if (by_rect && GetMonitorInfoW(by_rect, &monitor)) {
+        has_mon = TRUE;
+    } else {
+        HMONITOR fallback = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+        if (GetMonitorInfoW(fallback, &monitor)) has_mon = TRUE;
+    }
+    if (!has_mon) return FALSE;
+    work_w = monitor.rcWork.right - monitor.rcWork.left;
+    work_h = monitor.rcWork.bottom - monitor.rcWork.top;
+    min_w = min(MulDiv(520, dpi, 96), work_w);
+    min_h = min(MulDiv(320, dpi, 96), work_h);
+    *width = max(min_w, min(sw, work_w));
+    *height = max(min_h, min(sh, work_h));
+    if (IntersectRect(&intersect, &saved, &monitor.rcWork)) {
+        *x = max(monitor.rcWork.left, min(sx, monitor.rcWork.right - *width));
+        *y = max(monitor.rcWork.top, min(sy, monitor.rcWork.bottom - *height));
+    } else {
+        *x = monitor.rcWork.left + (work_w - *width) / 2;
+        *y = monitor.rcWork.top + (work_h - *height) / 2;
+    }
+    *maximized = max_flag != 0;
+    return TRUE;
 }
 
 static void remember_selection(Archive *archive) {
@@ -1147,10 +1260,33 @@ static LRESULT CALLBACK archive_proc(HWND window, UINT message, WPARAM wparam, L
     case ARCHIVE_SEARCH_DONE:
         if (archive->worker) finish_search(archive);
         return 0;
+    case WM_MOVE:
+        if (!IsIconic(window) && !IsZoomed(window)) {
+            GetWindowRect(window, &archive->normal_rect);
+            archive->has_rect = TRUE;
+        }
+        return 0;
+    case WM_EXITSIZEMOVE:
+        if (!IsIconic(window) && !IsZoomed(window)) {
+            GetWindowRect(window, &archive->normal_rect);
+            archive->has_rect = TRUE;
+        }
+        save_browser_placement(archive);
+        return 0;
     case WM_SIZE:
         /* Keep query, selection and native placement alive in the tray. */
-        if (wparam == SIZE_MINIMIZED) ShowWindow(window, SW_HIDE);
-        else archive_layout(archive);
+        if (wparam == SIZE_MINIMIZED) {
+            save_browser_placement(archive);
+            ShowWindow(window, SW_HIDE);
+        } else {
+            if (wparam == SIZE_MAXIMIZED) archive->maximized = TRUE;
+            else if (wparam == SIZE_RESTORED) {
+                archive->maximized = FALSE;
+                GetWindowRect(window, &archive->normal_rect);
+                archive->has_rect = TRUE;
+            }
+            archive_layout(archive);
+        }
         return 0;
     case ARCHIVE_REFRESH:
         if (archive->refresh_pending) refresh_archive(archive, FALSE);
@@ -1293,7 +1429,8 @@ static LRESULT CALLBACK archive_proc(HWND window, UINT message, WPARAM wparam, L
             return 0;
         }
         break;
-    case WM_CLOSE: DestroyWindow(window); return 0;
+    case WM_CLOSE: save_browser_placement(archive); DestroyWindow(window); return 0;
+    case WM_DESTROY: save_browser_placement(archive); return 0;
     case WM_NCDESTROY:
         calendar_list_close(window); free(archive->day_entries);
         search_destroy(archive->worker);
@@ -1317,6 +1454,7 @@ HWND archive_show(HWND owner, const wchar_t *directory, const wchar_t *settings,
     Archive *archive;
     MONITORINFO monitor = {sizeof(monitor)};
     int dpi, width, height, x, y;
+    BOOL maximized = FALSE;
     if (archive_window) {
         archive = (Archive *)GetWindowLongPtrW(archive_window, GWLP_USERDATA);
         if (!refresh_archive(archive, TRUE)) return NULL;
@@ -1340,17 +1478,22 @@ HWND archive_show(HWND owner, const wchar_t *directory, const wchar_t *settings,
     archive->recheck = -1;
     dpi = (int)GetDpiForWindow(owner); if (!dpi) dpi = 96;
     archive->dpi = dpi;
-    GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor);
-    width = min(MulDiv(800, dpi, 96), monitor.rcWork.right - monitor.rcWork.left);
-    height = min(MulDiv(580, dpi, 96), monitor.rcWork.bottom - monitor.rcWork.top);
-    x = monitor.rcWork.left + (monitor.rcWork.right - monitor.rcWork.left - width) / 2;
-    y = monitor.rcWork.top + (monitor.rcWork.bottom - monitor.rcWork.top - height) / 2;
-    archive_window = CreateWindowExW(WS_EX_TOPMOST, ARCHIVE_CLASS, L"Notes archive",
+    if (!load_browser_placement(owner, settings, dpi, &x, &y, &width, &height, &maximized)) {
+        GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor);
+        width = min(MulDiv(800, dpi, 96), monitor.rcWork.right - monitor.rcWork.left);
+        height = min(MulDiv(580, dpi, 96), monitor.rcWork.bottom - monitor.rcWork.top);
+        x = monitor.rcWork.left + (monitor.rcWork.right - monitor.rcWork.left - width) / 2;
+        y = monitor.rcWork.top + (monitor.rcWork.bottom - monitor.rcWork.top - height) / 2;
+    }
+    archive_window = CreateWindowExW(archive_topmost ? WS_EX_TOPMOST : 0, ARCHIVE_CLASS, L"Notes archive",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, y, width, height, owner, NULL, GetModuleHandleW(NULL), archive);
     /* WM_NCDESTROY owns the allocation once WM_NCCREATE succeeds. */
     if (!archive_window) return NULL;
+    SetRect(&archive->normal_rect, x, y, x + width, y + height);
+    archive->has_rect = TRUE;
+    archive->maximized = maximized;
     if (!refresh_archive(archive, TRUE)) { archive_close(); return NULL; }
-    ShowWindow(archive_window, SW_SHOWNORMAL); SetForegroundWindow(archive_window);
+    ShowWindow(archive_window, maximized ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL); SetForegroundWindow(archive_window);
     SetFocus(archive->list);
     return archive_window;
 }
@@ -1405,6 +1548,18 @@ void archive_date_changed(const wchar_t *id, unsigned date) {
 
 void archive_close(void) {
     if (archive_window) DestroyWindow(archive_window);
+}
+
+void archive_hide(void) {
+    if (archive_window && IsWindow(archive_window) && IsWindowVisible(archive_window))
+        ShowWindow(archive_window, SW_HIDE);
+}
+
+void archive_set_topmost(BOOL topmost) {
+    archive_topmost = topmost;
+    if (archive_window && IsWindow(archive_window))
+        SetWindowPos(archive_window, topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 void archive_search(void) {

@@ -15,6 +15,8 @@ enum { ARCHIVE_TAGS_CHANGED = 1 };
 void archive_changed(const wchar_t *id, BOOL present, unsigned changes);
 void archive_date_changed(const wchar_t *id, unsigned date);
 void archive_close(void);
+void archive_hide(void);
+void archive_set_topmost(BOOL topmost);
 void archive_search(void);
 void archive_notes(void);
 

@@ -1,6 +1,7 @@
 #include <windows.h>
 #include "resource.h"
 IDI_APP ICON "assets/jotilla.ico"
+IDI_APP_HIDDEN ICON "assets/jotilla_hidden.ico"
 IDR_LICENSE RCDATA "LICENSE"
 IDD_TITLE DIALOGEX 0, 0, 252, 84
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU

@@ -1,4 +1,5 @@
 #define IDI_APP 101
+#define IDI_APP_HIDDEN 102
 #define IDD_TITLE 201
 #define IDC_TITLE 1001
 #define IDD_TAGS 202

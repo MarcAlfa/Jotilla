@@ -46,6 +46,9 @@
 #define CMD_BROWSE 102
 #define CMD_TAGS 103
 #define CMD_SCROLL 104
+#define CMD_TOPMOST 105
+#define CMD_HIDE_ALL 106
+#define CMD_SHOW_ALL 107
 #define CMD_OPACITY 200
 #define CMD_SIZE 300
 #define CMD_PALETTE 400
@@ -64,7 +67,7 @@ struct Note {
     WNDPROC edit_proc;
     ITextDocument *document;
     HBRUSH brush;
-    HFONT font;
+    HFONT font, date_font;
     HPEN pen;
     wchar_t *accepted_text, *title, *tags;
     size_t text_capacity;
@@ -89,7 +92,7 @@ static const wchar_t *SIZE_NAMES[] = {L"Small", L"Medium", L"Large", L"Extra lar
 static const int OPACITIES[] = {100,90,80,70,60};
 static HINSTANCE instance;
 static HWND controller;
-static HICON app_icon;
+static HICON app_icon, hidden_icon;
 static Note *notes;
 /* Stable IDs survive closing a window; no pointer to a freed note is retained. */
 static wchar_t last_note[80], saved_last_note[80];
@@ -103,6 +106,8 @@ static int current_palette;
 static int favorite_palette = -1;
 static BOOL shuffled_palette;
 static BOOL default_scrolling;
+static BOOL always_on_top = TRUE;
+static BOOL notes_hidden;
 static BYTE color_bag[COLOR_COUNT];
 static int colors_left;
 static DWORD color_random;
@@ -623,7 +628,7 @@ static void show_note_palette(Note *note, POINT point) {
 }
 
 static void update_style(Note *note) {
-    HFONT old_font = note->font;
+    HFONT old_font = note->font, old_date_font = note->date_font;
     HPEN old_pen = note->pen;
     int previous_dpi = note->dpi;
     note->dpi = (int)GetDpiForWindow(note->window);
@@ -633,6 +638,9 @@ static void update_style(Note *note) {
     note->font = CreateFontW(-MulDiv(11, note->dpi, 72), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                             CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+    note->date_font = CreateFontW(-MulDiv(9, note->dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                 CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
     if (!note->ready) {
         CHARFORMAT2W format = {0};
         SendMessageW(note->edit, WM_SETFONT, (WPARAM)note->font, TRUE);
@@ -642,6 +650,7 @@ static void update_style(Note *note) {
     SendMessageW(note->edit, EM_SETBKGNDCOLOR, 0, note_color(note));
     note->pen = CreatePen(PS_SOLID, max(1, scaled(note, 1)), palette_bar_ink(note->palette,note->color));
     if (old_font) DeleteObject(old_font);
+    if (old_date_font) DeleteObject(old_date_font);
     if (old_pen) DeleteObject(old_pen);
 }
 
@@ -761,13 +770,51 @@ static void paint_note(Note *note) {
     SetDCBrushColor(dc, note->save_failed ? RGB(235, 161, 151) :
         palette_bar(color));
     FillRect(dc, &bar_rect, dc_brush);
-    if (note->title) {
-        RECT title_rect = {bar + scaled(note, 4), 0, rect.right - bar * 2 - scaled(note, 6), bar};
-        HGDIOBJ old_font = SelectObject(dc, note->font);
-        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, note->save_failed ? RGB(0,0,0) : palette_bar_ink(note->palette,note->color));
-        DrawTextW(dc, note->title, -1, &title_rect,
-                  DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
-        SelectObject(dc, old_font);
+    if (note->title || note->calendar_date) {
+        int text_left = bar + scaled(note, 4);
+        int text_right = rect.right - bar * 2 - scaled(note, 6);
+        if (text_right > text_left) {
+            static const wchar_t *WEEKDAYS[7] = {L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat", L"Sun"};
+            HGDIOBJ old_font = SelectObject(dc, note->font);
+            wchar_t date_text[32];
+            int date_w = 0;
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, note->save_failed ? RGB(0,0,0) : palette_bar_ink(note->palette,note->color));
+            if (note->calendar_date) {
+                RECT measure = {0, 0, 0, bar};
+                unsigned d = note->calendar_date;
+                int wd = date_weekday(d);
+                swprintf_s(date_text, 32, L"(%s %02u-%02u-%04u)",
+                           WEEKDAYS[(wd >= 0 && wd < 7) ? wd : 0], d % 100, (d / 100) % 100, d / 10000);
+                if (note->date_font) SelectObject(dc, note->date_font);
+                DrawTextW(dc, date_text, -1, &measure, DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+                date_w = measure.right - measure.left;
+            }
+            if (note->title) {
+                RECT title_measure = {0, 0, 0, bar}, title_rect = {text_left, 0, text_right, bar};
+                int title_w, gap = scaled(note, 6);
+                SelectObject(dc, note->font);
+                DrawTextW(dc, note->title, -1, &title_measure, DT_SINGLELINE | DT_CALCRECT | DT_NOPREFIX);
+                title_w = title_measure.right - title_measure.left;
+                if (note->calendar_date) {
+                    int avail = text_right - text_left;
+                    int reserve = avail > date_w + scaled(note, 24) ? date_w + gap : 0;
+                    int max_title = avail - reserve;
+                    int drawn_w = min(title_w, max_title);
+                    title_rect.right = text_left + drawn_w;
+                    text_left += drawn_w + gap;
+                }
+                DrawTextW(dc, note->title, -1, &title_rect,
+                          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+            if (note->calendar_date && text_right > text_left) {
+                RECT date_rect = {text_left, 0, text_right, bar};
+                if (note->date_font) SelectObject(dc, note->date_font);
+                DrawTextW(dc, date_text, -1, &date_rect,
+                          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+            SelectObject(dc, old_font);
+        }
     }
     button.left = 1; button.right = bar; button.top = 1; button.bottom = bar - 1;
     if (note->hover == 3) { SetDCBrushColor(dc,color); FillRect(dc,&button,dc_brush); }
@@ -1108,7 +1155,7 @@ static INT_PTR CALLBACK title_dialog(HWND dialog, UINT message, WPARAM wparam, L
         y=owner.top+bar_height(note);
         x=max(monitor.rcWork.left,min(x,monitor.rcWork.right-(rect.right-rect.left)));
         y=max(monitor.rcWork.top,min(y,monitor.rcWork.bottom-(rect.bottom-rect.top)));
-        SetWindowPos(dialog, HWND_TOPMOST, x,y,0,0,SWP_NOSIZE);
+        SetWindowPos(dialog, always_on_top ? HWND_TOPMOST : HWND_NOTOPMOST, x,y,0,0,SWP_NOSIZE);
         return TRUE;
     }
     if (message == WM_COMMAND && LOWORD(wparam) == IDOK) {
@@ -1222,7 +1269,7 @@ static INT_PTR CALLBACK tags_dialog(HWND dialog, UINT message, WPARAM wparam, LP
         suggest_tags(dialog, editor);
         GetWindowRect(editor->note->window, &owner); GetWindowRect(dialog, &rect);
         GetMonitorInfoW(MonitorFromWindow(editor->note->window, MONITOR_DEFAULTTONEAREST), &monitor);
-        SetWindowPos(dialog, HWND_TOPMOST,
+        SetWindowPos(dialog, always_on_top ? HWND_TOPMOST : HWND_NOTOPMOST,
             max(monitor.rcWork.left, min(owner.left, monitor.rcWork.right - (rect.right - rect.left))),
             max(monitor.rcWork.top, min(owner.top + bar_height(editor->note), monitor.rcWork.bottom - (rect.bottom - rect.top))),
             0, 0, SWP_NOSIZE);
@@ -1751,6 +1798,7 @@ static LRESULT CALLBACK note_proc(HWND window, UINT message, WPARAM wparam, LPAR
         if (*link) *link = note->next;
         if (note->brush) DeleteObject(note->brush);
         if (note->font) DeleteObject(note->font);
+        if (note->date_font) DeleteObject(note->date_font);
         if (note->pen) DeleteObject(note->pen);
         if (note->document) note->document->lpVtbl->Release(note->document);
         free(note->accepted_text);
@@ -1817,7 +1865,7 @@ static Note *open_note_at(const wchar_t *id, int color, BOOL restore, const POIN
         note->layout_saved = TRUE;
     }
     note->next = notes; notes = note;
-    window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, NOTE_CLASS, L"Jotilla",
+    window = CreateWindowExW(WS_EX_TOOLWINDOW | (always_on_top ? WS_EX_TOPMOST : 0), NOTE_CLASS, L"Jotilla",
                              WS_POPUP | WS_THICKFRAME | WS_CLIPCHILDREN,
                              x, y, width, note->collapsed ? bar_height(note) : height,
                              NULL, NULL, instance, note);
@@ -1910,13 +1958,20 @@ static BOOL restore_notes(void) {
     return ok;
 }
 
-static void tray(BOOL add) {
+static void update_tray(DWORD action) {
     NOTIFYICONDATAW data = {0};
     data.cbSize = sizeof(data); data.hWnd = controller; data.uID = 1;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-    data.uCallbackMessage = TRAY_MESSAGE; data.hIcon = app_icon ? app_icon : LoadIconW(NULL, IDI_APPLICATION);
-    wcscpy_s(data.szTip, 128, L"Jotilla - last note; double-click for explorer; Ctrl+Alt++ for new note");
-    Shell_NotifyIconW(add ? NIM_ADD : NIM_DELETE, &data);
+    data.uCallbackMessage = TRAY_MESSAGE;
+    data.hIcon = notes_hidden && hidden_icon ? hidden_icon : (app_icon ? app_icon : LoadIconW(NULL, IDI_APPLICATION));
+    wcscpy_s(data.szTip, 128, notes_hidden
+        ? L"Jotilla (notes hidden) - right-click to show all notes"
+        : L"Jotilla - last note; double-click for explorer; Ctrl+Alt++ for new note");
+    Shell_NotifyIconW(action, &data);
+}
+
+static void tray(BOOL add) {
+    update_tray(add ? NIM_ADD : NIM_DELETE);
 }
 
 static BOOL save_all(void) {
@@ -2040,6 +2095,8 @@ static void load_preferences(void) {
         last_note[0] = 0;
     wcscpy_s(saved_last_note, 80, last_note);
     default_scrolling = setting(L"app", L"scroll", FALSE) != 0;
+    always_on_top = setting(L"app", L"always_on_top", TRUE) != 0;
+    archive_set_topmost(always_on_top);
     next_color = setting(L"app", L"next_color", 0);
     if (next_color < 0 || next_color >= COLOR_COUNT) next_color = 0;
     saved_next_color = next_color;
@@ -2111,6 +2168,37 @@ static void choose_archive(HWND owner) {
     if (copies_left) report_error(controller, L"The new archive is active. Some original files could not be removed and remain in the previous folder as backup copies.");
 }
 
+static void apply_always_on_top(BOOL enabled) {
+    HWND insert = enabled ? HWND_TOPMOST : HWND_NOTOPMOST;
+    Note *note;
+    always_on_top = enabled;
+    for (note = notes; note; note = note->next) {
+        if (IsWindow(note->window))
+            SetWindowPos(note->window, insert, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+    archive_set_topmost(enabled);
+}
+
+static void toggle_always_on_top(void) {
+    BOOL next = !always_on_top;
+    if (!write_setting(L"app", L"always_on_top", next)) {
+        report_error(controller, L"The always on top setting could not be saved.");
+        return;
+    }
+    apply_always_on_top(next);
+}
+
+static void set_notes_hidden(BOOL hidden) {
+    Note *note;
+    notes_hidden = hidden;
+    for (note = notes; note; note = note->next) {
+        if (IsWindow(note->window))
+            ShowWindow(note->window, hidden ? SW_HIDE : SW_SHOWNOACTIVATE);
+    }
+    if (hidden) archive_hide();
+    update_tray(NIM_MODIFY);
+}
+
 static LRESULT CALLBACK controller_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
     static enum { TRAY_IDLE, TRAY_PENDING, TRAY_DOUBLE } tray_click;
     if (taskbar_created && message == taskbar_created) { tray(TRUE); return 0; }
@@ -2128,7 +2216,7 @@ static LRESULT CALLBACK controller_proc(HWND window, UINT message, WPARAM wparam
         if (lparam == WM_LBUTTONDOWN && tray_click == TRAY_DOUBLE) tray_click = TRAY_IDLE;
         if (lparam == WM_LBUTTONUP) {
             if (tray_click == TRAY_DOUBLE) tray_click = TRAY_IDLE;
-            else {
+            else if (!notes_hidden) {
                 /* Wait for Windows to distinguish a single click from a double click. */
                 tray_click = TRAY_PENDING;
                 if (!SetTimer(window, TRAY_CLICK_TIMER, GetDoubleClickTime(), NULL)) {
@@ -2144,20 +2232,33 @@ static LRESULT CALLBACK controller_proc(HWND window, UINT message, WPARAM wparam
         }
         if (lparam == WM_RBUTTONUP || lparam == WM_CONTEXTMENU) {
             POINT point;
-            HMENU menu = CreatePopupMenu();
+            HMENU menu = CreatePopupMenu(), options = CreatePopupMenu();
             UINT command;
             KillTimer(window, TRAY_CLICK_TIMER);
             tray_click = TRAY_IDLE;
-            if (!menu) return 0;
+            if (!menu || !options) {
+                if (menu) DestroyMenu(menu);
+                if (options) DestroyMenu(options);
+                return 0;
+            }
             GetCursorPos(&point);
+            AppendMenuW(options, MF_STRING | (always_on_top ? MF_CHECKED : 0), CMD_TOPMOST, L"Always on top");
+            if (notes_hidden) AppendMenuW(menu, MF_STRING, CMD_SHOW_ALL, L"Show all notes");
+            else AppendMenuW(menu, MF_STRING, CMD_HIDE_ALL, L"Hide all notes");
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(menu, MF_STRING, CMD_BROWSE, L"Browse notes");
             AppendMenuW(menu, MF_STRING, NEW_NOTE_MESSAGE, L"New note");
+            AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(menu, MF_POPUP, (UINT_PTR)options, L"Options");
             AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(menu, MF_STRING, EXIT_COMMAND, L"Exit");
             SetForegroundWindow(window);
             command = (UINT)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, NULL);
-            if (command == CMD_BROWSE) browse_notes();
+            if (command == CMD_HIDE_ALL) set_notes_hidden(TRUE);
+            else if (command == CMD_SHOW_ALL) set_notes_hidden(FALSE);
+            else if (command == CMD_BROWSE) browse_notes();
             else if (command == NEW_NOTE_MESSAGE) PostMessageW(window, NEW_NOTE_MESSAGE, 0, 0);
+            else if (command == CMD_TOPMOST) toggle_always_on_top();
             else if (command == EXIT_COMMAND) PostMessageW(window, WM_CLOSE, 0, 0);
             PostMessageW(window, WM_NULL, 0, 0);
             DestroyMenu(menu);
@@ -2249,6 +2350,7 @@ int WINAPI wWinMain(_In_ HINSTANCE app, _In_opt_ HINSTANCE previous, _In_ PWSTR 
     }
     load_preferences();
     app_icon = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
+    hidden_icon = (HICON)LoadImageW(instance, MAKEINTRESOURCEW(IDI_APP_HIDDEN), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR);
     if (!register_classes()) { CloseHandle(mutex); return 1; }
     controller = CreateWindowExW(WS_EX_TOOLWINDOW, APP_CLASS, L"Jotilla", WS_OVERLAPPED,
                                  0, 0, 0, 0, NULL, NULL, instance, NULL);
@@ -2274,6 +2376,7 @@ int WINAPI wWinMain(_In_ HINSTANCE app, _In_opt_ HINSTANCE previous, _In_ PWSTR 
         TranslateMessage(&message); DispatchMessageW(&message);
     }
     if (app_icon) DestroyIcon(app_icon);
+    if (hidden_icon) DestroyIcon(hidden_icon);
     CloseHandle(mutex);
     return result < 0 ? 1 : 0;
 }
