@@ -4,6 +4,15 @@ Small, native notes with autosave, an archive and a calendar. No extra dependenc
 
 **[Visit the Jotilla website](https://garaugarau.github.io/Jotilla/)**
 
+## Fork enhancements (`marcalfa`)
+
+Built on top of [GarauGarau/Jotilla](https://github.com/GarauGarau/Jotila) (`windows` branch) with four Windows additions:
+
+- **Global `Always on top` toggle** — right-click the tray icon → **Options** → **Always on top** (persisted in `notes.ini`, applied immediately to all notes, dialogs, and the archive browser).
+- **Persistent `Notes archive` placement** — remembers position, size, monitor, and maximized state across minimize-to-tray, close, and exit, with safe fallback if a monitor is disconnected.
+- **Note bar date display** — shows the assigned calendar date after the title (`Title (Weekday DD-MM-YYYY)`) and highlights today/past dates in contrast-safe red.
+- **Tray privacy mode (`Hide all notes` / `Show all notes`)** — hides all open notes and the archive browser from the desktop, switches the tray icon to slate-blue (`assets/jotilla_hidden.ico`), and restores them from the tray menu.
+
 ## Download
 
 | System | Installer | Portable · no installation |
